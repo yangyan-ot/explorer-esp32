@@ -3,16 +3,16 @@
  * 硬件: ESP32 + MPU6050
  *
  * 采样配置:
- *   - 传感器采样率: 50 Hz
+ *   - 传感器采样率: 100 Hz
  *   - 每个数据包样本数: 5
- *   - 数据包发送频率: 10 Hz
- *   - 串口波特率：57600
+ *   - 数据包发送频率: 20 Hz
+ *   - 串口波特率：115200
  *
  * 传输协议:
  *   - 固定 66 字节数据包
  *   - 依照AnyShake官方文档Protocol v1 (Legacy)中的协议所上传
  *   - Observer配置文件中请将协议设置为"v1"以便正常识别数据
- * 编写时间：2026年1月7日02:30分
+ * 编写时间：2026年2月23日21:50分
  * 代码使用Qwen3.0 DeepSeek ChatGPT依次优化改进
  */
 
@@ -22,15 +22,11 @@
 MPU6050 mpu;
 
 // ================= 配置参数 =================
-#define SAMPLE_RATE           50        // 传感器原始采样率 (Hz)
+#define SAMPLE_RATE           100       // 传感器原始采样率 (Hz)
 #define SAMPLE_INTERVAL_US    (1000000UL / SAMPLE_RATE)  // 采样间隔 (微秒)
 
 #define SAMPLES_PER_PACKET    5         // 每个数据包包含的样本数
 #define CALIBRATION_SAMPLES   200       // 校准时采集的样本总数
-
-#define TEMP_COEFF_X          0.0f      // 温度补偿系数 (X轴，当前固定为0)
-#define TEMP_COEFF_Y          0.0f      // 温度补偿系数 (Y轴，当前固定为0)
-#define TEMP_COEFF_Z          0.0f      // 温度补偿系数 (Z轴，当前固定为0)
 
 #define PACKET_HEADER_0       0xFC      // 数据包起始头字节0
 #define PACKET_HEADER_1       0x1B      // 数据包起始头字节1
@@ -38,7 +34,6 @@ MPU6050 mpu;
 
 // ================= 全局变量 =================
 int32_t offset_x = 0, offset_y = 0, offset_z = 0;  // 三轴加速度计零偏校准值
-float calib_temp = 0.0f, current_temp = 0.0f;      // 校准温度与当前温度
 uint32_t lastSampleTimeUs = 0;                     // 上次采样时间戳 (微秒)
 
 int32_t samples_z[SAMPLES_PER_PACKET];             // Z轴高通滤波后数据缓冲区
@@ -91,14 +86,12 @@ void updateZOffset(int32_t raw_z) {
  * 三轴加速度计校准 (静止状态采集平均值)
  * 1. 采集200个样本
  * 2. 计算三轴平均值作为零偏
- * 3. 读取当前温度用于温度补偿 (未实际使用)
  */
 void performCalibration() {
     long sum_x = 0, sum_y = 0, sum_z = 0;
     int16_t ax, ay, az;
 
     delay(500);  // 等待传感器稳定
-    calib_temp = mpu.getTemperature() / 340.0f + 36.53f;  // 温度转换公式
 
     for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
         mpu.getAcceleration(&ax, &ay, &az);
@@ -115,7 +108,7 @@ void performCalibration() {
 
 // ================= 初始化 =================
 void setup() {
-    Serial.begin(57600);  // 串口初始化 (57600波特率)
+    Serial.begin(115200);  // 串口初始化
     Wire.begin();         // I2C初始化
     Wire.setClock(400000); // I2C时钟频率 (400kHz)
 
@@ -125,7 +118,6 @@ void setup() {
 
     performCalibration();  // 执行加速度计校准
 
-    current_temp = calib_temp;  // 初始化当前温度
     lastSampleTimeUs = micros(); // 初始化采样时间戳
 }
 
@@ -138,15 +130,6 @@ void loop() {
 
         int16_t ax, ay, az;
         mpu.getAcceleration(&ax, &ay, &az);  // 读取原始加速度
-
-        // 每50次采样更新一次温度 (约1秒)
-        static uint8_t temp_counter = 0;
-        if (++temp_counter >= 50) {
-            current_temp = mpu.getTemperature() / 340.0f + 36.53f;
-            temp_counter = 0;
-        }
-
-        float temp_diff = current_temp - calib_temp;  // 温度变化量 (未实际使用)
 
         // 应用零偏校准
         int32_t val_x = ax - offset_x;
