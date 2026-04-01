@@ -12,180 +12,154 @@
  *   - 固定 66 字节数据包
  *   - 依照AnyShake官方文档Protocol v1 (Legacy)中的协议所上传
  *   - Observer配置文件中请将协议设置为"v1"以便正常识别数据
- * 编写时间：2026年2月23日21:50分
+ * 编写时间：2026年04月01日23:10分
  * 代码使用Qwen3.0 DeepSeek ChatGPT依次优化改进
  */
-
-#include <Wire.h>
-#include <MPU6050.h>
-
-MPU6050 mpu;
-
-// ================= 配置参数 =================
-#define SAMPLE_RATE           100       // 传感器原始采样率 (Hz)
-#define SAMPLE_INTERVAL_US    (1000000UL / SAMPLE_RATE)  // 采样间隔 (微秒)
-
-#define SAMPLES_PER_PACKET    5         // 每个数据包包含的样本数
-#define CALIBRATION_SAMPLES   200       // 校准时采集的样本总数
-
-#define PACKET_HEADER_0       0xFC      // 数据包起始头字节0
-#define PACKET_HEADER_1       0x1B      // 数据包起始头字节1
-#define PACKET_SIZE           66        // 完整数据包大小 (字节)
-
-// ================= 全局变量 =================
-int32_t offset_x = 0, offset_y = 0, offset_z = 0;  // 三轴加速度计零偏校准值
-uint32_t lastSampleTimeUs = 0;                     // 上次采样时间戳 (微秒)
-
-int32_t samples_z[SAMPLES_PER_PACKET];             // Z轴高通滤波后数据缓冲区
-int32_t samples_e[SAMPLES_PER_PACKET];             // E轴 (X轴) 高通滤波后数据缓冲区
-int32_t samples_n[SAMPLES_PER_PACKET];             // N轴 (Y轴) 高通滤波后数据缓冲区
-uint8_t sample_idx = 0;                            // 当前缓冲区写入索引
-
-uint8_t packet_buffer[PACKET_SIZE];                // 66字节数据包缓冲区
-
-// 高通滤波器状态 (用于消除重力分量)
-float filtered_z = 0, filtered_e = 0, filtered_n = 0;
-int32_t last_val_z = 0, last_val_e = 0, last_val_n = 0;
-const float HPF_ALPHA = 0.995f;                    // 高通滤波器系数 (0.995 = 99.5%保留)
-
-// 动态零偏估计缓冲区（Z轴，用于静止时自动校准）
-#define OFFSET_WINDOW 200
-int32_t offset_buffer_z[OFFSET_WINDOW];            // Z轴零偏缓冲区 (200个样本)
-uint8_t offset_ptr_z = 0;                          // 缓冲区指针
-
-// ================= 工具函数 =================
 /**
- * 计算数组校验和 (按字节异或)
- * @param array 需计算校验和的整数数组
- * @param count 数组元素数量
- * @return 校验和字节
+ * 协议 v1 (传统版本)
+ * 硬件: ESP32 + MPU6050
  */
+
+#include <Wire.h>        // I2C通信库
+#include <MPU6050.h>     // MPU6050传感器库
+
+MPU6050 mpu;             // 创建MPU6050对象
+
+// ===== 配置 =====
+#define SAMPLE_RATE           100                         // 采样频率（Hz）
+#define SAMPLE_INTERVAL_US    (1000000UL / SAMPLE_RATE)   // 采样间隔（微秒）
+
+#define SAMPLES_PER_PACKET    5   // 每个数据包包含5组数据
+
+#define PACKET_HEADER_0       0xFC   // 数据包头字节1
+#define PACKET_HEADER_1       0x1B   // 数据包头字节2
+#define PACKET_SIZE           66     // 整个数据包长度（字节）
+
+// ===== 校准配置 =====
+#define CALIB_SAMPLES 500   // 校准采样次数（约5秒）
+
+int32_t bias_x = 0;   // X轴零偏
+int32_t bias_y = 0;   // Y轴零偏
+int32_t bias_z = 0;   // Z轴零偏
+
+// ===== 变量 =====
+uint32_t lastSampleTimeUs = 0;   // 上一次采样时间（微秒）
+
+// 存储一包数据（5个样本）
+int32_t samples_z[SAMPLES_PER_PACKET];
+int32_t samples_e[SAMPLES_PER_PACKET];  // east（x轴）
+int32_t samples_n[SAMPLES_PER_PACKET];  // north（y轴）
+uint8_t sample_idx = 0;                 // 当前采样索引
+
+uint8_t packet_buffer[PACKET_SIZE];     // 发送缓冲区
+
+// ===== 校验函数 =====
+// 对数据做异或校验（简单校验）
 uint8_t calculate_checksum(int32_t* array, uint8_t count) {
     uint8_t checksum = 0;
-    uint8_t* ptr = (uint8_t*)array;
+    uint8_t* ptr = (uint8_t*)array;   // 转为字节指针
+
+    // 遍历所有字节做 XOR
     for (uint16_t i = 0; i < count * sizeof(int32_t); i++) {
         checksum ^= ptr[i];
     }
     return checksum;
 }
 
-/**
- * 更新Z轴动态零偏 (静止时自动校准)
- * @param raw_z 原始Z轴加速度值
- */
-void updateZOffset(int32_t raw_z) {
-    offset_buffer_z[offset_ptr_z++] = raw_z;
-    if (offset_ptr_z >= OFFSET_WINDOW) offset_ptr_z = 0;
-    long sum = 0;
-    for (int i = 0; i < OFFSET_WINDOW; i++) sum += offset_buffer_z[i];
-    offset_z = sum / OFFSET_WINDOW;  // 计算移动平均零偏
-}
+// ===== 校准函数 =====
+// 开机时测量静止状态下的偏移量（零偏）
+void calibrateMPU() {
+    Serial.println("Calibrating... Keep device still!");
 
-// ================= 校准 =================
-/**
- * 三轴加速度计校准 (静止状态采集平均值)
- * 1. 采集200个样本
- * 2. 计算三轴平均值作为零偏
- */
-void performCalibration() {
-    long sum_x = 0, sum_y = 0, sum_z = 0;
+    int64_t sum_x = 0;
+    int64_t sum_y = 0;
+    int64_t sum_z = 0;
+
     int16_t ax, ay, az;
 
-    delay(500);  // 等待传感器稳定
-
-    for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    // 多次采样取平均
+    for (int i = 0; i < CALIB_SAMPLES; i++) {
         mpu.getAcceleration(&ax, &ay, &az);
+
         sum_x += ax;
         sum_y += ay;
         sum_z += az;
-        delay(2);  // 2ms间隔
+
+        delay(5); // 稍微延时，让数据更稳定
     }
 
-    offset_x = sum_x / CALIBRATION_SAMPLES;  // X轴零偏
-    offset_y = sum_y / CALIBRATION_SAMPLES;  // Y轴零偏
-    offset_z = sum_z / CALIBRATION_SAMPLES;  // Z轴零偏
+    // 计算平均值作为偏移量
+    bias_x = sum_x / CALIB_SAMPLES;
+    bias_y = sum_y / CALIB_SAMPLES;
+    bias_z = sum_z / CALIB_SAMPLES;
+
+    Serial.println("Calibration done!");
+    Serial.print("Bias X: "); Serial.println(bias_x);
+    Serial.print("Bias Y: "); Serial.println(bias_y);
+    Serial.print("Bias Z: "); Serial.println(bias_z);
 }
 
-// ================= 初始化 =================
+// ===== 初始化 =====
 void setup() {
-    Serial.begin(115200);  // 串口初始化
-    Wire.begin();         // I2C初始化
-    Wire.setClock(400000); // I2C时钟频率 (400kHz)
+    Serial.begin(115200);   // 初始化串口
+    Wire.begin();           // 初始化I2C
+    Wire.setClock(400000);  // 设置I2C为400kHz高速模式
 
-    mpu.initialize();                     // MPU6050初始化
-    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);  // 设置±2g量程
-    mpu.setDLPFMode(MPU6050_DLPF_BW_20);  // 设置低通滤波带宽20Hz
+    mpu.initialize();       // 初始化MPU6050
 
-    performCalibration();  // 执行加速度计校准
+    // 设置加速度量程（±2g，精度最高）
+    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
 
-    lastSampleTimeUs = micros(); // 初始化采样时间戳
+    delay(1000); // 等待传感器稳定
+
+    calibrateMPU();  // 开机自动校准
+
+    lastSampleTimeUs = micros(); // 记录当前时间
 }
 
-// ================= 主循环 =================
+// ===== 主循环 =====
 void loop() {
-    uint32_t now = micros();
-    // 检查是否到达下一次采样时间
+    uint32_t now = micros(); // 当前时间（微秒）
+
+    // 到达采样时间
     if ((uint32_t)(now - lastSampleTimeUs) >= SAMPLE_INTERVAL_US) {
         lastSampleTimeUs += SAMPLE_INTERVAL_US;
 
         int16_t ax, ay, az;
-        mpu.getAcceleration(&ax, &ay, &az);  // 读取原始加速度
+        mpu.getAcceleration(&ax, &ay, &az); // 读取加速度
 
-        // 应用零偏校准
-        int32_t val_x = ax - offset_x;
-        int32_t val_y = ay - offset_y;
-        int32_t val_z = az - offset_z;
-
-        // 高通滤波器 (去除重力分量)
-        filtered_e = HPF_ALPHA * (filtered_e + val_x - last_val_e);
-        filtered_n = HPF_ALPHA * (filtered_n + val_y - last_val_n);
-        filtered_z = HPF_ALPHA * (filtered_z + val_z - last_val_z);
-        last_val_e = val_x;  // 更新上一次值
-        last_val_n = val_y;
-        last_val_z = val_z;
-
-        // 保存滤波后数据到缓冲区
-        samples_e[sample_idx] = (int32_t)filtered_e;
-        samples_n[sample_idx] = (int32_t)filtered_n;
-        samples_z[sample_idx] = (int32_t)filtered_z;
-
-        // 静止状态动态校准Z轴零偏 (当三轴加速度均<1000时)
-        if (abs(val_x) < 1000 && abs(val_y) < 1000 && abs(val_z) < 1000) {
-            updateZOffset(az);
-        }
+        // 减去零偏（让静止时输出接近0）
+        samples_e[sample_idx] = ax - bias_x;
+        samples_n[sample_idx] = ay - bias_y;
+        samples_z[sample_idx] = az - bias_z;
 
         sample_idx++;
-        if (sample_idx >= SAMPLES_PER_PACKET) {  // 达到5个样本后发送数据包
-            sendPacket();
-            sample_idx = 0;
+
+        // 收集满一包数据
+        if (sample_idx >= SAMPLES_PER_PACKET) {
+            sendPacket();      // 发送数据
+            sample_idx = 0;    // 重置索引
         }
     }
 }
 
-// ================= 数据包发送 =================
-/**
- * 构建并发送66字节数据包
- * 数据结构:
- *   [0-1]  2字节头 (0xFC, 0x1B)
- *   [2-21] Z轴5个样本 (20字节)
- *   [22-41] E轴5个样本 (20字节)
- *   [42-61] N轴5个样本 (20字节)
- *   [62-64] 三轴校验和
- *   [65]   0x00 (填充字节)
- */
+// ===== 数据发送 =====
 void sendPacket() {
+    // 写入包头
     packet_buffer[0] = PACKET_HEADER_0;
     packet_buffer[1] = PACKET_HEADER_1;
 
-    memcpy(&packet_buffer[2],  samples_z, 20);  // 复制Z轴数据 (5×4字节)
-    memcpy(&packet_buffer[22], samples_e, 20);  // 复制E轴数据
-    memcpy(&packet_buffer[42], samples_n, 20);  // 复制N轴数据
+    // 拷贝数据（每组5个int32 = 20字节）
+    memcpy(&packet_buffer[2],  samples_z, 20);
+    memcpy(&packet_buffer[22], samples_e, 20);
+    memcpy(&packet_buffer[42], samples_n, 20);
 
-    // 计算并填充校验和
+    // 添加校验
     packet_buffer[62] = calculate_checksum(samples_z, SAMPLES_PER_PACKET);
     packet_buffer[63] = calculate_checksum(samples_e, SAMPLES_PER_PACKET);
     packet_buffer[64] = calculate_checksum(samples_n, SAMPLES_PER_PACKET);
-    packet_buffer[65] = 0x00;  // 填充字节
+    packet_buffer[65] = 0x00;  // 预留字节
 
-    Serial.write(packet_buffer, PACKET_SIZE);  // 发送完整数据包
+    // 发送整个数据包
+    Serial.write(packet_buffer, PACKET_SIZE);
 }
